@@ -1,0 +1,88 @@
+# -----
+# Build commands (examples)
+# -----
+# docker build -t lammps-ml-mix:latest .
+# docker build -t lammps-ml-mix:latest . > build.log 2>&1
+# docker build --no-cache -t lammps-ml-mix:latest . > build.log 2>&1
+# docker run --rm -it --gpus all lammps-ml-mix:latest
+
+# -----
+# Base image
+# -----
+FROM nvidia/cuda:12.5.1-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/opt/conda/bin:$PATH
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake g++ libopenmpi-dev \
+        python3 python3-dev python3-pip python3-setuptools \
+        python3-numpy python3-scipy \
+        git wget curl tar unzip \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# -----
+# Clone LAMMPS
+# -----
+WORKDIR /opt
+RUN git clone --branch release https://github.com/lammps/lammps.git && \
+    cd lammps && \
+    git fetch --tags && \
+    git checkout tags/stable_22Jul2025
+
+# -----
+# Prepare CUDA stubs for LAMMPS build
+# -----
+RUN mkdir -p /usr/local/cuda/lib64/stubs
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 || true
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}
+
+# -----
+# Build LAMMPS with ML-MIX
+# -----
+WORKDIR /opt/lammps/build
+
+# Download additional packages (e.g., PACE)
+RUN wget -O libpace.tar.gz https://github.com/wcwitt/lammps-user-pace/archive/main.tar.gz
+
+RUN cmake ../cmake \
+    -D CMAKE_CXX_COMPILER=/opt/lammps/lib/kokkos/bin/nvcc_wrapper \
+    -D CMAKE_BUILD_TYPE=Release \
+    -D BUILD_MPI=ON \
+    -D PKG_KOKKOS=ON \
+    -D Kokkos_ENABLE_SERIAL=ON \
+    -D Kokkos_ARCH_ADA89=ON \
+    -D BUILD_SHARED_LIBS=ON \
+    -D BUILD_OMP=ON \
+    -D Kokkos_ENABLE_CUDA=ON \
+    -D CMAKE_INSTALL_PREFIX=/usr/local \
+    -D PACELIB_MD5=$(md5sum libpace.tar.gz | awk '{print $1}') \
+    -D PKG_ML-UF3=ON \
+    -D PKG_ML-PACE=ON \
+    -D PKG_ML-SNAP=ON \
+    -D PKG_RIGID=ON \
+    -D PKG_MANYBODY=ON \
+    -D PKG_MOLECULE=ON \
+    -D PKG_EXTRA-PAIR=ON
+
+RUN cmake --build . -j $(nproc) && cmake --install .
+
+# -----
+# Build with ML-MIX
+# -----
+
+WORKDIR /app/ml-mix
+COPY . .
+
+# Install ML-MIX plugin into LAMMPS
+WORKDIR /app/ml-mix/LAMMPS_plugin
+RUN ./install.sh /opt/lammps
+
+WORKDIR /opt/lammps/build
+RUN cmake --build . -j $(nproc) && cmake --install .
+
+# Return to ML-MIX directory
+WORKDIR /app/ml-mix
